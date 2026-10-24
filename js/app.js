@@ -1,4 +1,4 @@
-/* Punchlist v3 — plain JS SPA. Vendors are teams (e.g. D2) with employees (e.g. Leo). Accounts + data live in Supabase (row-level security);
+/* Punchlist v4 — plain JS SPA. Vendors are teams (e.g. D2) with employees (e.g. Leo); admins can "View as" an employee. Accounts + data live in Supabase (row-level security);
    transcription settings stay on this phone. */
 (function () {
   'use strict';
@@ -43,7 +43,10 @@
   }
 
   // ---------- state ----------
-  let session = null, me = null;            // me = my profile row
+  let session = null, me = null;            // me = my profile row (while viewing-as: the previewed employee)
+  let realMe = null, viewAs = null;         // realMe = the signed-in admin; viewAs = previewed employee's profile id
+  let roster = { vendors: [], profiles: [] }; // all vendors/employees, for the View-as switcher
+  const VIEW_AS = 'punchlist.viewAs';
   let db = emptyDb();
   let view = 'list', authMode = 'signin', review = null, offline = false, booted = false, recovering = false;
   function emptyDb() { return { companies: [], addresses: [], lists: [], vendors: [], profiles: [], invites: [], notifications: [] }; }
@@ -65,29 +68,60 @@
   const unread = () => db.notifications.filter(n => !n.read_at).length;
   const cacheKey = () => 'punchlist.cache.' + session.user.id;
 
+  function buildDb(co, ad, pl, it, cc, vd, pr, inv, nt) {
+    const ccBy = {}; cc.forEach(c => (ccBy[c.item_id] = ccBy[c.item_id] || []).push(c.vendor_id));
+    const byList = {}; it.forEach(i => (byList[i.punchlist_id] = byList[i.punchlist_id] || []).push({
+      id: i.id, text: i.text, done: i.done, doneAt: i.done_at, doneBy: i.done_by, vendorId: i.vendor_id, assigneeId: i.assignee_id, source: i.source, createdAt: i.created_at, ccs: ccBy[i.id] || [] }));
+    return {
+      companies: co, addresses: ad.map(a => ({ id: a.id, address: a.address, nicknames: a.nicknames || [] })),
+      lists: pl.map(l => ({ id: l.id, companyId: l.company_id, addressId: l.address_id, createdAt: l.created_at, items: byList[l.id] || [] })),
+      vendors: vd, profiles: pr, invites: inv, notifications: nt
+    };
+  }
+  // View as: the server returns exactly the rows that employee can read under RLS (admins only).
+  async function refreshViewAs() {
+    try {
+      const [s, rv, rp] = await Promise.all([
+        sb.rpc('view_as', { p_profile_id: viewAs }).then(must),
+        sb.from('vendors').select('id,name,is_test').order('name').then(must),
+        sb.from('profiles').select('id,display_name,role,vendor_id').eq('role', 'vendor').order('display_name').then(must)
+      ]);
+      me = s.me; roster = { vendors: rv, profiles: rp };
+      db = buildDb(s.companies, s.addresses, s.punchlists, s.items, s.item_ccs, s.vendors, s.profiles, [], s.notifications);
+      setOffline(false);
+    } catch (e) {
+      if (!navigator.onLine) { setOffline(true); render(); return; }
+      toast('View as ended: ' + e.message, 4000); return exitViewAs();
+    }
+    render();
+  }
+  async function enterViewAs(pid) {
+    if (!pid || !realMe || realMe.role !== 'admin') return;
+    viewAs = pid; sessionStorage.setItem(VIEW_AS, pid); review = null; view = 'mine'; window.scrollTo(0, 0);
+    await refresh();
+    if (viewAs && me) toast(`Previewing as ${me.display_name}. Anything you check off counts as them.`, 3500);
+  }
+  async function exitViewAs() {
+    viewAs = null; sessionStorage.removeItem(VIEW_AS); me = realMe; view = 'team'; window.scrollTo(0, 0);
+    await refresh();
+  }
   async function refresh() {
     if (!session || !me) return;
+    if (viewAs) return refreshViewAs();
     try {
       const q = t => sb.from(t);
       const [co, ad, pl, it, cc, vd, pr, inv, nt] = await Promise.all([
-        fetchAll(() => q('companies').select('id,name').order('name').order('id')),
+        fetchAll(() => q('companies').select('id,name,is_test').order('name').order('id')),
         fetchAll(() => q('addresses').select('id,address,nicknames').order('address').order('id')),
         fetchAll(() => q('punchlists').select('id,company_id,address_id,created_at').order('id')),
         fetchAll(() => q('items').select('id,punchlist_id,text,done,done_at,done_by,vendor_id,assignee_id,source,created_at').order('created_at').order('id')),
         fetchAll(() => q('item_ccs').select('item_id,vendor_id').order('item_id').order('vendor_id')),
-        fetchAll(() => q('vendors').select('id,name,created_at').order('name').order('id')),
+        fetchAll(() => q('vendors').select('id,name,created_at,is_test').order('name').order('id')),
         fetchAll(() => q('profiles').select('id,user_id,display_name,role,vendor_id,vendor_company,created_at').order('display_name').order('id')),
         isAdmin() ? fetchAll(() => q('invite_codes').select('code,profile_id,created_at,expires_at,used_at,used_email').order('created_at').order('code')) : [],
         q('notifications').select('id,item_id,kind,message,created_at,read_at').order('created_at', { ascending: false }).limit(100).then(must)
       ]);
-      const ccBy = {}; cc.forEach(c => (ccBy[c.item_id] = ccBy[c.item_id] || []).push(c.vendor_id));
-      const byList = {}; it.forEach(i => (byList[i.punchlist_id] = byList[i.punchlist_id] || []).push({
-        id: i.id, text: i.text, done: i.done, doneAt: i.done_at, doneBy: i.done_by, vendorId: i.vendor_id, assigneeId: i.assignee_id, source: i.source, createdAt: i.created_at, ccs: ccBy[i.id] || [] }));
-      db = {
-        companies: co, addresses: ad.map(a => ({ id: a.id, address: a.address, nicknames: a.nicknames || [] })),
-        lists: pl.map(l => ({ id: l.id, companyId: l.company_id, addressId: l.address_id, createdAt: l.created_at, items: byList[l.id] || [] })),
-        vendors: vd, profiles: pr, invites: inv, notifications: nt
-      };
+      db = buildDb(co, ad, pl, it, cc, vd, pr, inv, nt); roster = { vendors: vd, profiles: pr };
       setOffline(false);
       try { localStorage.setItem(cacheKey(), JSON.stringify({ me, db })); } catch (e) { /* quota */ }
     } catch (e) {
@@ -107,7 +141,7 @@
     ['companies', 'addresses', 'punchlists', 'items', 'item_ccs', 'vendors', 'profiles'].forEach(t =>
       channel.on('postgres_changes', { event: '*', schema: 'public', table: t }, refreshSoon));
     channel.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, p => {
-      if (p.new && p.new.message) toast('🔔 ' + p.new.message, 5000);
+      if (p.new && p.new.message && !viewAs) toast('🔔 ' + p.new.message, 5000);
       refreshSoon();
     });
     channel.subscribe();
@@ -116,8 +150,8 @@
 
   // ---------- auth ----------
   async function onSession(s) {
-    session = s; me = null;
-    if (!s) { unsubscribe(); db = emptyDb(); view = 'list'; render(); return; }
+    session = s; me = null; realMe = null; viewAs = null;
+    if (!s) { unsubscribe(); sessionStorage.removeItem(VIEW_AS); db = emptyDb(); view = 'list'; render(); return; }
     try {
       me = must(await sb.from('profiles').select('id,user_id,display_name,role,vendor_id,vendor_company').eq('user_id', s.user.id).maybeSingle());
     } catch (e) {
@@ -130,10 +164,12 @@
       if (pending) { try { await redeem(pending); return; } catch (e) { toast(e.message, 5000); } }
       view = 'link'; render(); return;
     }
+    realMe = me; viewAs = (isAdmin() && sessionStorage.getItem(VIEW_AS)) || null;
+    const asAdmin = isAdmin() && !viewAs;
     const adminViews = ['list', 'jobs', 'team', 'profiles', 'settings', 'alerts'], vendorViews = ['mine', 'alerts', 'settings'];
-    if (!(isAdmin() ? adminViews : vendorViews).includes(view)) view = isAdmin() ? 'list' : 'mine';
+    if (!(asAdmin ? adminViews : vendorViews).includes(view)) view = asAdmin ? 'list' : 'mine';
     await refresh(); subscribe();
-    if (isAdmin()) maybeOfferImport();
+    if (isAdmin() && !viewAs) maybeOfferImport();
   }
   async function redeem(code) {
     const r = must(await sb.rpc('redeem_invite', { p_code: code }));
@@ -302,7 +338,7 @@
   async function toggleItem(id) {
     const [, it] = findItem(id); if (!it) return;
     const done = !it.done; it.done = done; it.doneAt = done ? new Date().toISOString() : null; it.doneBy = done ? me.id : null; render();
-    try { must(await sb.rpc('set_item_done', { p_item_id: id, p_done: done })); }
+    try { must(await (viewAs ? sb.rpc('set_item_done_as', { p_item_id: id, p_done: done, p_profile_id: viewAs }) : sb.rpc('set_item_done', { p_item_id: id, p_done: done }))); }
     catch (e) { it.done = !done; render(); toast(e.message); return; }
     if (done && it.ccs.length) toast(`Done. cc'd team${it.ccs.length === 1 ? '' : 's'} notified: ${it.ccs.map(vname).join(', ')}.`);
   }
@@ -380,7 +416,8 @@
     if (!ids.length) return;
     const now = new Date().toISOString();
     db.notifications.forEach(n => { if (ids.includes(n.id)) n.read_at = n.read_at || now; }); render();
-    must(await sb.from('notifications').update({ read_at: now }).in('id', ids).is('read_at', null));
+    if (viewAs) must(await sb.rpc('mark_notifications_read_as', { p_profile_id: viewAs, p_ids: ids }));
+    else must(await sb.from('notifications').update({ read_at: now }).in('id', ids).is('read_at', null));
   }
 
   // ---------- import of v1 (phone-only) data ----------
@@ -446,6 +483,10 @@
       const tabs = isAdmin() ? ADMIN_TABS : VENDOR_TABS;
       tb.innerHTML = tabs.map(([v, i, l]) => `<button data-view="${v}" class="${v === view ? 'active' : ''}"><span>${i}</span>${l}</button>`).join('');
     }
+    const vb = $('#viewAsBar'); vb.hidden = !(signedIn && viewAs);
+    if (signedIn && viewAs) vb.innerHTML = `<span>👁️ Viewing as <b>${esc(me.display_name)}</b> (${esc(vname(me.vendor_id))})</span> · <button class="linkbtn" data-action="exit-view-as">Exit</button>`;
+    document.body.classList.toggle('viewing-as', !!(signedIn && viewAs));
+    if (signedIn && viewAs) { const top = document.querySelector('header.topbar'); vb.style.top = (top ? top.offsetHeight : 0) + 'px'; }
     const n = signedIn ? unread() : 0;
     $('#bell').hidden = !signedIn; $('#badge').hidden = !n; $('#badge').textContent = n > 99 ? '99+' : n;
     $('#scanFab').hidden = !(signedIn && isAdmin() && !offline && (view === 'list' || view === 'jobs'));
@@ -558,12 +599,13 @@
         <div class="meta">${status}</div>
         ${!p.user_id && live ? `<div class="row"><div class="code grow">${esc(live.code)}</div><button class="btn small ghost" data-action="copy-invite" data-code="${esc(live.code)}">Share</button></div><small class="muted">Expires ${fmtDate(live.expires_at)}</small>` : ''}
         <div class="row end">${!p.user_id ? `<button class="btn small ghost" data-action="new-code" data-id="${p.id}">${live ? 'New code' : 'Get code'}</button>` : ''}
+          ${p.role === 'vendor' ? `<button class="btn small ghost viewas-btn" data-action="view-as" data-id="${p.id}">👁️ View as ${esc(p.display_name.split(' ')[0])}</button>` : ''}
           <button class="btn small ghost" data-action="edit-person" data-id="${p.id}">Edit</button>
           ${p.id !== me.id ? `<button class="btn small ghost dangertext" data-action="del-person" data-id="${p.id}">Remove</button>` : ''}</div></li>`;
     };
     const vcard = v => {
       const emps = employees(v.id).sort((a, b) => a.display_name.localeCompare(b.display_name)), open = openFor(i => i.vendorId === v.id);
-      return `<li class="card col vendor" data-vendor="${v.id}"><div class="row"><div class="grow"><b class="vname">🏷️ ${esc(v.name)}</b>
+      return `<li class="card col vendor" data-vendor="${v.id}"><div class="row"><div class="grow"><b class="vname">🏷️ ${esc(v.name)}</b>${v.is_test ? ' <span class="tag test">TEST</span>' : ''}
           <div class="muted small">${emps.length} employee${emps.length === 1 ? '' : 's'} · ${open} open item${open === 1 ? '' : 's'}</div></div>
           <button class="btn small ghost" data-action="edit-vendor" data-id="${v.id}">Rename</button><button class="btn small ghost dangertext" data-action="del-vendor" data-id="${v.id}" aria-label="Remove vendor">✕</button></div>
         ${emps.length ? `<ul class="emps">${emps.map(person).join('')}</ul>` : '<p class="muted small">No employees yet.</p>'}
@@ -578,7 +620,7 @@
 
   function viewProfiles() {
     return `<div class="section-h"><h2 class="title">Companies</h2><button class="btn small primary" data-action="add-company">＋ Company</button></div>
-      ${db.companies.length ? `<ul class="cards">${db.companies.map(c => `<li class="card"><div class="grow"><b>${esc(c.name)}</b></div>
+      ${db.companies.length ? `<ul class="cards">${db.companies.map(c => `<li class="card"><div class="grow"><b>${esc(c.name)}</b>${c.is_test ? ' <span class="tag test">TEST</span>' : ''}</div>
         <button class="btn small ghost" data-action="edit-company" data-id="${c.id}">Edit</button><button class="btn small ghost dangertext" data-action="del-company" data-id="${c.id}">Delete</button></li>`).join('')}</ul>` : '<p class="muted pad">No companies yet.</p>'}
       <div class="section-h"><h2 class="title">Job addresses</h2><button class="btn small primary" data-action="add-address">＋ Address</button></div>
       ${db.addresses.length ? `<ul class="cards">${db.addresses.map(a => `<li class="card col"><div><b>${esc(a.address)}</b></div>
@@ -620,12 +662,26 @@
   function viewSettings() {
     const s = prefs.settings;
     const radio = (v, label, sub) => `<label class="radio"><input type="radio" name="provider" value="${v}" ${s.provider === v ? 'checked' : ''}><span><b>${label}</b><small>${sub}</small></span></label>`;
+    const viewAsCard = () => {
+      if (!realMe || realMe.role !== 'admin') return '';
+      const vs = [...roster.vendors].sort((a, b) => a.name.localeCompare(b.name));
+      const opts = vs.map(v => { const es = roster.profiles.filter(p => p.vendor_id === v.id && p.role === 'vendor');
+        return es.length ? `<optgroup label="${esc(v.name)}${v.is_test ? ' (test)' : ''}">${es.map(p => `<option value="${p.id}" ${p.id === viewAs ? 'selected' : ''}>${esc(p.display_name)}</option>`).join('')}</optgroup>` : ''; }).join('');
+      return `<h2 class="title">View as</h2><div class="card col">
+        <p class="muted small">See the app exactly as a vendor employee sees it: their team's items, items their team is cc'd on (read-only), and their alerts. No password or extra login. Anything you check off counts as them.</p>
+        ${opts ? `<div class="row"><select id="viewAsPick" class="grow">${opts}</select><button class="btn primary" data-action="view-as-pick">${viewAs ? 'Switch' : 'View as'}</button></div>` : '<p class="muted small">Add a vendor employee in Team first.</p>'}
+        ${viewAs ? '<div class="row end"><button class="btn ghost" data-action="exit-view-as">Exit View as</button></div>' : ''}</div>`;
+    };
+    if (viewAs) return `<h2 class="title">Account</h2><div class="card col">
+        <div class="row"><div class="grow"><b>${esc(me.display_name)}</b><div class="muted small">${esc(vname(me.vendor_id))} · preview, no login</div></div><span class="tag vendor">Vendor</span></div>
+        <p class="muted small">You're signed in as ${esc(realMe.display_name)} (${esc(session.user.email)}) and previewing ${esc(me.display_name)}'s view.</p></div>`
+      + viewAsCard() + `<p class="muted small pad">Punchlist v4 · L&amp;L Builders</p>`;
     const account = `<h2 class="title">Account</h2><div class="card col">
         <div class="row"><div class="grow"><b>${esc(me.display_name)}</b><div class="muted small">${esc(session.user.email)}${me.vendor_id ? ' · ' + esc(vname(me.vendor_id)) : ''}</div></div><span class="tag ${me.role}">${isAdmin() ? 'Admin' : 'Vendor'}</span></div>
         <div class="row end"><button class="btn ghost" data-action="signout">Sign out</button></div></div>`;
-    if (!isAdmin()) return account + `<p class="muted small pad">Punchlist v3 · L&amp;L Builders</p>`;
+    if (!isAdmin()) return account + `<p class="muted small pad">Punchlist v4 · L&amp;L Builders</p>`;
     const old = oldLocalData();
-    return account + `<h2 class="title">Photo transcription</h2>
+    return account + viewAsCard() + `<h2 class="title">Photo transcription</h2>
       <div class="card col">
         ${radio('openai', 'OpenAI (recommended)', 'Best handwriting accuracy. Needs an OpenAI API key; about a fraction of a cent per photo.')}
         ${radio('gemini', 'Google Gemini', 'Very good handwriting accuracy. Needs a Gemini API key (free tier available from Google AI Studio).')}
@@ -647,7 +703,7 @@
         <label class="btn ghost">Import backup<input type="file" id="importFile" accept="application/json,.json" hidden></label>
         ${old ? '<button class="btn ghost" data-action="import-phone">Upload this phone\'s old data</button>' : ''}</div>
       </div>
-      <p class="muted small pad">Punchlist v3 · L&amp;L Builders</p>`;
+      <p class="muted small pad">Punchlist v4 · L&amp;L Builders</p>`;
   }
 
   // ---------- scan / review ----------
@@ -750,7 +806,7 @@
     try { await fn(); } catch (e) { toast(e.message || String(e), 4000); }
   }
   const needsOnline = new Set(['add-company', 'add-address', 'edit-company', 'del-company', 'edit-address', 'del-address', 'add-nick', 'toggle', 'edit-item', 'del-item',
-    'add-vendor', 'edit-vendor', 'del-vendor', 'add-employee', 'add-admin', 'edit-person', 'del-person', 'new-code', 'read-all', 'import-phone', 'rv-save']);
+    'add-vendor', 'edit-vendor', 'del-vendor', 'add-employee', 'add-admin', 'edit-person', 'del-person', 'new-code', 'read-all', 'import-phone', 'rv-save', 'view-as', 'view-as-pick']);
   document.addEventListener('click', e => guarded(async () => {
     const tab = e.target.closest('.tabbar button');
     if (tab) { if (view === 'review' && !(await confirmDialog('Leave scan?', 'Discard this scan review?', 'Discard'))) return; review = null; view = tab.dataset.view; render(); window.scrollTo(0, 0); return; }
@@ -778,6 +834,9 @@
       case 'share': return shareList();
       case 'print': return window.print();
       case 'open-list': prefs.current = { companyId: el.dataset.c, addressId: el.dataset.a }; savePrefs(); view = 'list'; return render();
+      case 'view-as': return enterViewAs(id);
+      case 'view-as-pick': { const sel = $('#viewAsPick'); return enterViewAs(sel && sel.value); }
+      case 'exit-view-as': return exitViewAs();
       case 'add-vendor': return addVendor();
       case 'edit-vendor': return editVendor(id);
       case 'del-vendor': return deleteVendor(id);
@@ -876,7 +935,7 @@
 
   if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
   // test hook
-  window.PLApp = { get db() { return db; }, get me() { return me; }, prefs, render, refresh, setView: v => { view = v; render(); }, startScan, sb };
+  window.PLApp = { get db() { return db; }, get me() { return me; }, get viewAs() { return viewAs; }, enterViewAs, exitViewAs, prefs, render, refresh, setView: v => { view = v; render(); }, startScan, sb };
 
   // ---------- boot ----------
   if (!sb) {

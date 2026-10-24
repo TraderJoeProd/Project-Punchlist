@@ -1,5 +1,5 @@
 // App-shell cache. Bump VERSION when files change.
-const VERSION = 'punchlist-v3';
+const VERSION = 'punchlist-v4';
 const SUPABASE_JS = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/dist/umd/supabase.min.js';
 const SHELL = ['./', 'index.html', 'css/styles.css', 'js/config.js', 'js/parse.js', 'js/transcribe.js', 'js/app.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 self.addEventListener('install', e => {

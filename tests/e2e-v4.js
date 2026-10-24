@@ -1,11 +1,13 @@
-// Headless UI check of Punchlist v3 (vendor teams) against the real Supabase project, with temporary test logins.
+// Headless UI check of Punchlist v4 (vendor teams + admin View as) against the real Supabase project, with temporary test logins.
 // Setup: run tests/e2e-v3-seed.sql; afterwards run tests/e2e-v3-cleanup.sql.
-// Run: node tests/e2e-v3.js (needs playwright-core + Chrome, and a local server on :8080)
+// Needs the Bob demo (supabase/seed_bob_demo.sql) to exist; it is only read, never changed.
+// Run: node tests/e2e-v4.js (needs playwright-core + Chrome, and a local server on :8080)
 const { chromium } = require(process.env.PW || 'playwright-core');
 const BASE = process.env.BASE || 'http://127.0.0.1:8080/';
 const SHOTS = __dirname + '/../screenshots/';
 const PW = 'TestPass!2026';
 const D2 = '33333333-0000-4000-8000-0000000000d2', ROSSI = '33333333-0000-4000-8000-000000000010';
+const BOB_CO = 'Bob Building Co';
 const LEO = '22222222-0000-4000-8000-000000000002', SAM = '22222222-0000-4000-8000-000000000003', MIKE = '22222222-0000-4000-8000-000000000004';
 const I = n => '44444444-0000-4000-8000-00000000000' + n;
 const results = []; const ok = (name, cond) => { results.push([cond ? 'PASS' : 'FAIL', name]); };
@@ -40,7 +42,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   await pA.evaluate(() => { const P = window.PLApp; P.prefs.current = { companyId: '33333333-0000-4000-8000-000000000001', addressId: '33333333-0000-4000-8000-000000000002' }; P.setView('list'); });
   await pA.waitForSelector('text=Frame closet opening');
   ok('admin sees "D2 · Leo" for narrowed item', await pA.isVisible('.tag.assignee >> text=D2 · Leo'));
-  ok('assign menu groups employees under vendors', await pA.$$eval('#assignTo optgroup', g => g.map(x => x.label).join('|')) === 'D2|Rossi Plumbing (TEST)|Project admins');
+  ok('assign menu groups employees under vendors', await pA.$$eval('#assignTo optgroup', g => g.map(x => x.label).join('|')) === 'Bob Building Co|D2|Rossi Plumbing (TEST)|Project admins');
   await pA.selectOption('#assignTo', 'v:' + D2);
   await pA.fill('#newItem', 'Install shoe molding'); await pA.press('#newItem', 'Enter');
   await pA.waitForSelector('.item >> text=Install shoe molding');
@@ -130,6 +132,48 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   ok('Nina linked to D2 via code', await pN.evaluate(D2 => window.PLApp.me.vendor_id === D2, D2));
   ok('Nina sees D2 items incl. done by Sam', JSON.stringify(await texts(pN)) === d2set && (await item(pN, I(2))).doneBy === SAM);
   await shot(pN, '38-new-employee-after-link.png');
+
+  // 6. View as (admin previews a vendor employee, no extra login)
+  const leoDirect = await pL.evaluate(async () => (await window.PLApp.sb.rpc('view_as', { p_profile_id: window.PLApp.me.id })).error);
+  ok('vendor cannot call view_as', !!leoDirect && /admin/i.test(leoDirect.message));
+  const leoAs = await pL.evaluate(async id => (await window.PLApp.sb.rpc('set_item_done_as', { p_item_id: id, p_done: true, p_profile_id: window.PLApp.me.id })).error, I(1));
+  ok('vendor cannot call set_item_done_as', !!leoAs);
+  await pA.click('#tabbar button[data-view=team]'); await pA.waitForSelector('.card.vendor');
+  ok('Team shows "View as" on each vendor employee (not on admins/pending)', await pA.isVisible(`[data-vendor="${D2}"] [data-action=view-as][data-id="${LEO}"]`)
+    && await pA.isVisible('.card.vendor:has-text("Bob Building Co") [data-action=view-as] >> text=View as Bob'));
+  ok('Bob Building Co tagged TEST', await pA.isVisible('.card.vendor:has-text("Bob Building Co") .tag.test'));
+  await pA.evaluate(() => document.querySelector('.card.vendor:has(.vname)') && [...document.querySelectorAll('.card.vendor')].find(c => c.textContent.includes('Bob Building Co')).scrollIntoView());
+  await shot(pA, '40-team-view-as-button.png');
+  await pA.click(`[data-action=view-as][data-id="${LEO}"]`);
+  await pA.waitForSelector('#viewAsBar:not([hidden]) >> text=Viewing as');
+  ok('banner reads "Viewing as Leo (D2) · Exit"', /Viewing as Leo \(D2\)\s*·\s*Exit/.test((await pA.textContent('#viewAsBar')).trim()));
+  ok('preview uses vendor tabs', await pA.$$eval('#tabbar button', b => b.map(x => x.dataset.view).join()) === 'mine,alerts,settings');
+  ok('preview shows exactly Leo\'s items', JSON.stringify(await texts(pA)) === JSON.stringify(await texts(pL)));
+  ok('preview shows exactly Leo\'s alerts', await pA.evaluate(() => window.PLApp.db.notifications.map(n => n.id).sort().join()) === await pL.evaluate(() => window.PLApp.db.notifications.map(n => n.id).sort().join()));
+  ok('preview cc item read-only', await pA.isVisible('.item.readonly:has-text("Cap rough-in drain")'));
+  await pA.click('.item:has-text("Frame closet opening") .check');
+  await pA.waitForFunction(id => { const i = window.PLApp.db.lists.flatMap(l => l.items).find(x => x.id === id); return i && i.done; }, I(1), { timeout: 15000 });
+  ok('check-off in preview recorded as Leo (done_by = Leo)', (await item(pA, I(1))).doneBy === LEO);
+  await pL.waitForFunction(id => { const i = window.PLApp.db.lists.flatMap(l => l.items).find(x => x.id === id); return i && i.done; }, I(1), { timeout: 15000 });
+  ok('real Leo sees it live as done by himself', (await item(pL, I(1))).doneBy === LEO);
+  // switch to Bob from Settings
+  await pA.click('#tabbar button[data-view=settings]'); await pA.waitForSelector('#viewAsPick');
+  ok('Settings switcher lists Bob under Bob Building Co (test)', await pA.$$eval('#viewAsPick optgroup', g => g.some(x => x.label === 'Bob Building Co (test)' && x.textContent.includes('Bob'))));
+  await shot(pA, '42-settings-view-as-switcher.png');
+  const bobId = await pA.$eval('#viewAsPick optgroup[label="Bob Building Co (test)"] option', o => o.value);
+  await pA.selectOption('#viewAsPick', bobId); await pA.click('[data-action=view-as-pick]');
+  await pA.waitForSelector('#viewAsBar >> text=Bob Building Co');
+  await pA.waitForSelector("text=Bob Building Co's open items");
+  ok('banner reads "Viewing as Bob (Bob Building Co) · Exit"', /Viewing as Bob \(Bob Building Co\)\s*·\s*Exit/.test((await pA.textContent('#viewAsBar')).trim()));
+  ok('Bob sees his 3 team items + 1 cc item', JSON.stringify(await texts(pA)) === JSON.stringify(['Patch drywall by front door', 'Re-hang closet doors in bedroom 2', 'Regrout guest bath shower', 'Touch up paint in hallway']));
+  ok('Bob\'s cc item is read-only', await pA.isVisible('.item.readonly:has-text("Regrout guest bath shower")'));
+  ok('Bob sees nothing of D2', await pA.evaluate(D2 => !window.PLApp.db.lists.flatMap(l => l.items).some(i => i.vendorId === D2), D2));
+  await shot(pA, '41-view-as-bob-banner.png');
+  await pA.reload(); await pA.waitForSelector('#viewAsBar:not([hidden]) >> text=Viewing as Bob');
+  ok('preview survives a reload (same tab)', true);
+  await pA.click('#viewAsBar [data-action=exit-view-as]');
+  await pA.waitForSelector('#tabbar button[data-view=jobs]');
+  ok('Exit returns to the admin view', await pA.isHidden('#viewAsBar') && await pA.evaluate(() => window.PLApp.me.role === 'admin' && !window.PLApp.viewAs));
 
   ok('no page errors (' + errors.join(' | ') + ')', errors.length === 0);
   await browser.close();

@@ -116,3 +116,13 @@ dialog::backdrop { background: rgba(15,25,40,.5); }
 .team-line { margin-top: -6px; }
 small.doneby { display: block; }
 optgroup { font-weight: 700; }
+
+/* v4: View as (admin preview of a vendor employee) */
+.viewas-banner { position: sticky; top: 0; z-index: 9; display: flex; align-items: center; justify-content: center; gap: 4px; padding: 8px 14px; background: #6b3fa0; color: #fff; font-size: 14px; box-shadow: 0 2px 6px rgba(0,0,0,.15); }
+.viewas-banner[hidden] { display: none; }
+.viewas-banner .grow { flex: 1; }
+.viewas-banner .linkbtn { color: #fff; text-decoration: underline; padding: 4px 6px; }
+body.viewing-as .topbar { border-bottom: 3px solid #6b3fa0; }
+.tag.test { background: #efe3fb; color: #6b3fa0; }
+.viewas-btn { white-space: nowrap; }
+.emp .row.end { flex-wrap: wrap; }

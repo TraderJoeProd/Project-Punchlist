@@ -1,4 +1,4 @@
--- RLS / RPC test for Punchlist v3 (vendor teams). Runs inside one transaction and finishes by raising an
+-- RLS / RPC test for Punchlist v3/v4 (vendor teams + admin View-as). Runs inside one transaction and finishes by raising an
 -- exception that carries the results, so every row it creates is rolled back. Expect "FAILS=0".
 do $$
 declare
@@ -7,6 +7,7 @@ declare
   pa uuid; d2 uuid; ro uuid; leo uuid; sam uuid; mike uuid; co uuid; ad uuid; pl uuid;
   i1 uuid; i2 uuid; i3 uuid; i4 uuid; i5 uuid;
   code text; n int; t text; out text := ''; fails int := 0;
+  j1 jsonb; j2 jsonb; v jsonb; k int; who uuid[]; whou uuid[]; nids bigint[];
 begin
   insert into auth.users (id, email, aud, role) values
     (ua, 'rls-admin@example.invalid', 'authenticated', 'authenticated'),
@@ -112,6 +113,116 @@ begin
   if t not like '%by Mike (Rossi Plumbing)%' then fails := fails + 1; out := out || 'FAIL completer not named; '; end if;
   select count(*) into n from public.notifications where kind = 'cc' and profile_id in (leo, sam);
   if n <> 2 then fails := fails + 1; out := out || 'FAIL cc notif fan-out; '; else out := out || 'ok cc notification went to both D2 employees; '; end if;
+
+  -- ===== VIEW AS (v4) =====
+  -- non-admins are rejected by all three View-as RPCs
+  perform set_config('request.jwt.claims', json_build_object('sub', us, 'role', 'authenticated')::text, true);
+  execute 'set local role authenticated';
+  begin perform public.view_as(leo); fails := fails + 1; out := out || 'FAIL Sam used view_as; ';
+  exception when insufficient_privilege then out := out || 'ok view_as rejected for vendor; '; end;
+  begin perform public.set_item_done_as(i1, true, leo); fails := fails + 1; out := out || 'FAIL Sam used set_item_done_as; ';
+  exception when insufficient_privilege then out := out || 'ok set_item_done_as rejected for vendor; '; end;
+  begin perform public.mark_notifications_read_as(leo, array[1::bigint]); fails := fails + 1; out := out || 'FAIL Sam used mark_read_as; ';
+  exception when insufficient_privilege then out := out || 'ok mark_notifications_read_as rejected for vendor; '; end;
+  begin perform public.view_as(mike); fails := fails + 1; out := out || 'FAIL Sam viewed other vendor; ';
+  exception when insufficient_privilege then out := out || 'ok vendor cannot view as another vendor; '; end;
+  -- a vendor cannot spoof the acting-profile setting: done_by stays Sam
+  perform set_config('punchlist.act_as', leo::text, true);
+  perform public.set_item_done(i1, true);
+  execute 'reset role';
+  perform set_config('punchlist.act_as', '', true);
+  select done_by::text into t from public.items where id = i1;
+  if t is distinct from sam::text then fails := fails + 1; out := out || 'FAIL act_as spoofed by vendor (' || coalesce(t, 'null') || '); ';
+  else out := out || 'ok vendor cannot spoof act_as; '; end if;
+  update public.items set done = false where id = i1;
+
+  perform set_config('request.jwt.claims', json_build_object('sub', un, 'role', 'authenticated')::text, true);
+  execute 'set local role authenticated';
+  begin perform public.view_as(leo); fails := fails + 1; out := out || 'FAIL no-profile user used view_as; ';
+  exception when insufficient_privilege then out := out || 'ok view_as rejected for no-profile user; '; end;
+  execute 'reset role';
+  perform set_config('request.jwt.claims', '', true);
+  execute 'set local role anon';
+  begin perform public.view_as(leo); fails := fails + 1; out := out || 'FAIL anon used view_as; ';
+  exception when insufficient_privilege then out := out || 'ok view_as denied to anon; '; end;
+  execute 'reset role';
+
+  -- admin: only vendor employees can be previewed
+  perform set_config('request.jwt.claims', json_build_object('sub', ua, 'role', 'authenticated')::text, true);
+  execute 'set local role authenticated';
+  begin perform public.view_as(pa); fails := fails + 1; out := out || 'FAIL view_as admin profile; ';
+  exception when invalid_parameter_value then out := out || 'ok view_as only for vendor employees; '; end;
+  execute 'reset role';
+
+  -- faithful: view_as(X) returns exactly the rows X reads through RLS
+  who := array[leo, sam, mike]; whou := array[ul, us, um];
+  for k in 1..3 loop
+    perform set_config('request.jwt.claims', json_build_object('sub', whou[k], 'role', 'authenticated')::text, true);
+    execute 'set local role authenticated';
+    select jsonb_build_object(
+      'items', (select coalesce(jsonb_agg(id::text order by id::text), '[]') from public.items),
+      'vendors', (select coalesce(jsonb_agg(id::text order by id::text), '[]') from public.vendors),
+      'profiles', (select coalesce(jsonb_agg(id::text order by id::text), '[]') from public.profiles),
+      'companies', (select coalesce(jsonb_agg(id::text order by id::text), '[]') from public.companies),
+      'addresses', (select coalesce(jsonb_agg(id::text order by id::text), '[]') from public.addresses),
+      'punchlists', (select coalesce(jsonb_agg(id::text order by id::text), '[]') from public.punchlists),
+      'item_ccs', (select coalesce(jsonb_agg(item_id::text || '/' || vendor_id::text order by item_id::text || '/' || vendor_id::text), '[]') from public.item_ccs),
+      'notifications', (select coalesce(jsonb_agg(id::text order by id::text), '[]') from public.notifications)) into j1;
+    execute 'reset role';
+    perform set_config('request.jwt.claims', json_build_object('sub', ua, 'role', 'authenticated')::text, true);
+    execute 'set local role authenticated';
+    v := public.view_as(who[k])::jsonb;
+    execute 'reset role';
+    select jsonb_build_object(
+      'items', (select coalesce(jsonb_agg(e->>'id' order by e->>'id'), '[]') from jsonb_array_elements(v->'items') e),
+      'vendors', (select coalesce(jsonb_agg(e->>'id' order by e->>'id'), '[]') from jsonb_array_elements(v->'vendors') e),
+      'profiles', (select coalesce(jsonb_agg(e->>'id' order by e->>'id'), '[]') from jsonb_array_elements(v->'profiles') e),
+      'companies', (select coalesce(jsonb_agg(e->>'id' order by e->>'id'), '[]') from jsonb_array_elements(v->'companies') e),
+      'addresses', (select coalesce(jsonb_agg(e->>'id' order by e->>'id'), '[]') from jsonb_array_elements(v->'addresses') e),
+      'punchlists', (select coalesce(jsonb_agg(e->>'id' order by e->>'id'), '[]') from jsonb_array_elements(v->'punchlists') e),
+      'item_ccs', (select coalesce(jsonb_agg((e->>'item_id') || '/' || (e->>'vendor_id') order by (e->>'item_id') || '/' || (e->>'vendor_id')), '[]') from jsonb_array_elements(v->'item_ccs') e),
+      'notifications', (select coalesce(jsonb_agg(e->>'id' order by e->>'id'), '[]') from jsonb_array_elements(v->'notifications') e)) into j2;
+    if j1 is distinct from j2 or (v->'me'->>'id') is distinct from who[k]::text then
+      fails := fails + 1; out := out || 'FAIL view_as differs from RLS for ' || k || ': rls=' || j1::text || ' view=' || j2::text || '; ';
+    else out := out || 'ok view_as = RLS for ' || (array['Leo','Sam','Mike'])[k] || ' (' || jsonb_array_length(j1->'items') || ' items, ' || jsonb_array_length(j1->'notifications') || ' alerts); '; end if;
+  end loop;
+
+  -- admin checks off as Leo: done_by = Leo, admins told "by Leo (D2)", cc items stay read-only
+  perform set_config('request.jwt.claims', json_build_object('sub', ua, 'role', 'authenticated')::text, true);
+  execute 'set local role authenticated';
+  perform public.set_item_done_as(i1, true, leo);
+  begin perform public.set_item_done_as(i3, false, leo); fails := fails + 1; out := out || 'FAIL view-as toggled cc item; ';
+  exception when insufficient_privilege then out := out || 'ok view-as cannot toggle cc item; '; end;
+  begin perform public.set_item_done_as(i3, false, sam); fails := fails + 1; out := out || 'FAIL view-as toggled other team item; ';
+  exception when insufficient_privilege then out := out || 'ok view-as limited to the employee''s team; '; end;
+  execute 'reset role';
+  select done_by::text into t from public.items where id = i1 and done;
+  if t is distinct from leo::text then fails := fails + 1; out := out || 'FAIL done_by after view-as = ' || coalesce(t, 'null') || '; ';
+  else out := out || 'ok set_item_done_as records done_by = Leo; '; end if;
+  select message into t from public.notifications where kind = 'completed' and item_id = i1 and profile_id = pa;
+  if t is null or t not like '%by Leo (D2)%' then fails := fails + 1; out := out || 'FAIL admin not told Leo did it; ';
+  else out := out || 'ok admin notified "by Leo (D2)"; '; end if;
+  -- the acting setting does not leak: the admin's own toggle is stamped as the admin
+  perform set_config('request.jwt.claims', json_build_object('sub', ua, 'role', 'authenticated')::text, true);
+  execute 'set local role authenticated';
+  perform public.set_item_done(i1, false); perform public.set_item_done(i1, true);
+  select count(*) into n from public.notifications where profile_id = leo and read_at is null;
+  execute 'reset role';
+  select done_by::text into t from public.items where id = i1;
+  if t is distinct from pa::text then fails := fails + 1; out := out || 'FAIL admin toggle stamped ' || coalesce(t, 'null') || '; ';
+  else out := out || 'ok admin''s own check-off still stamped as admin; '; end if;
+  if n <> 0 then fails := fails + 1; out := out || 'FAIL admin read Leo notifs directly; '; end if;
+  -- mark Leo's alerts read as Leo
+  select count(*) into n from public.notifications where profile_id = leo and read_at is null;
+  nids := array(select id from public.notifications where profile_id = leo);
+  perform set_config('request.jwt.claims', json_build_object('sub', ua, 'role', 'authenticated')::text, true);
+  execute 'set local role authenticated';
+  perform public.mark_notifications_read_as(leo, nids);
+  execute 'reset role';
+  select count(*) into k from public.notifications where profile_id = leo and read_at is null;
+  if n = 0 or k <> 0 then fails := fails + 1; out := out || 'FAIL mark_read_as (' || n || '->' || k || '); ';
+  else out := out || 'ok mark_notifications_read_as cleared ' || n || ' of Leo''s alerts; '; end if;
+  update public.items set done = false where id = i1;
 
   -- ===== nobody / anon =====
   perform set_config('request.jwt.claims', json_build_object('sub', un, 'role', 'authenticated')::text, true);
