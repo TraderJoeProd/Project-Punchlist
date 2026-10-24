@@ -1,4 +1,4 @@
-/* Punchlist v2 — plain JS SPA. Accounts + data live in Supabase (row-level security);
+/* Punchlist v3 — plain JS SPA. Vendors are teams (e.g. D2) with employees (e.g. Leo). Accounts + data live in Supabase (row-level security);
    transcription settings stay on this phone. */
 (function () {
   'use strict';
@@ -46,12 +46,18 @@
   let session = null, me = null;            // me = my profile row
   let db = emptyDb();
   let view = 'list', authMode = 'signin', review = null, offline = false, booted = false, recovering = false;
-  function emptyDb() { return { companies: [], addresses: [], lists: [], profiles: [], invites: [], notifications: [] }; }
+  function emptyDb() { return { companies: [], addresses: [], lists: [], vendors: [], profiles: [], invites: [], notifications: [] }; }
   const isAdmin = () => !!me && me.role === 'admin';
   const company = id => db.companies.find(c => c.id === id);
   const address = id => db.addresses.find(a => a.id === id);
   const profile = id => db.profiles.find(p => p.id === id);
   const pname = id => { const p = profile(id); return p ? p.display_name : 'someone'; };
+  const vendor = id => (db.vendors || []).find(v => v.id === id);
+  const vname = id => { const v = vendor(id); return v ? v.name : 'a vendor'; };
+  const employees = vid => db.profiles.filter(p => p.vendor_id === vid);
+  // "D2", "D2 · Leo" or "Joseph" — who an item is with
+  const ownerLabel = i => i.vendorId ? vname(i.vendorId) + (i.assigneeId ? ' · ' + pname(i.assigneeId) : '') : i.assigneeId ? pname(i.assigneeId) : '';
+  const byWho = id => id === (me && me.id) ? 'you' : pname(id) + (profile(id) && profile(id).vendor_id ? ' (' + vname(profile(id).vendor_id) + ')' : '');
   const addrLabel = a => a ? (a.nicknames && a.nicknames.length ? a.nicknames[0] + ' · ' + a.address : a.address) : '';
   const getList = (cId, aId) => db.lists.find(x => x.companyId === cId && x.addressId === aId);
   const currentList = () => prefs.current.companyId && prefs.current.addressId ? getList(prefs.current.companyId, prefs.current.addressId) : null;
@@ -63,23 +69,24 @@
     if (!session || !me) return;
     try {
       const q = t => sb.from(t);
-      const [co, ad, pl, it, cc, pr, inv, nt] = await Promise.all([
+      const [co, ad, pl, it, cc, vd, pr, inv, nt] = await Promise.all([
         fetchAll(() => q('companies').select('id,name').order('name').order('id')),
         fetchAll(() => q('addresses').select('id,address,nicknames').order('address').order('id')),
         fetchAll(() => q('punchlists').select('id,company_id,address_id,created_at').order('id')),
-        fetchAll(() => q('items').select('id,punchlist_id,text,done,done_at,done_by,assignee_id,source,created_at').order('created_at').order('id')),
-        fetchAll(() => q('item_ccs').select('item_id,profile_id').order('item_id').order('profile_id')),
-        fetchAll(() => q('profiles').select('id,user_id,display_name,role,vendor_company,created_at').order('display_name').order('id')),
+        fetchAll(() => q('items').select('id,punchlist_id,text,done,done_at,done_by,vendor_id,assignee_id,source,created_at').order('created_at').order('id')),
+        fetchAll(() => q('item_ccs').select('item_id,vendor_id').order('item_id').order('vendor_id')),
+        fetchAll(() => q('vendors').select('id,name,created_at').order('name').order('id')),
+        fetchAll(() => q('profiles').select('id,user_id,display_name,role,vendor_id,vendor_company,created_at').order('display_name').order('id')),
         isAdmin() ? fetchAll(() => q('invite_codes').select('code,profile_id,created_at,expires_at,used_at,used_email').order('created_at').order('code')) : [],
         q('notifications').select('id,item_id,kind,message,created_at,read_at').order('created_at', { ascending: false }).limit(100).then(must)
       ]);
-      const ccBy = {}; cc.forEach(c => (ccBy[c.item_id] = ccBy[c.item_id] || []).push(c.profile_id));
+      const ccBy = {}; cc.forEach(c => (ccBy[c.item_id] = ccBy[c.item_id] || []).push(c.vendor_id));
       const byList = {}; it.forEach(i => (byList[i.punchlist_id] = byList[i.punchlist_id] || []).push({
-        id: i.id, text: i.text, done: i.done, doneAt: i.done_at, doneBy: i.done_by, assigneeId: i.assignee_id, source: i.source, createdAt: i.created_at, ccs: ccBy[i.id] || [] }));
+        id: i.id, text: i.text, done: i.done, doneAt: i.done_at, doneBy: i.done_by, vendorId: i.vendor_id, assigneeId: i.assignee_id, source: i.source, createdAt: i.created_at, ccs: ccBy[i.id] || [] }));
       db = {
         companies: co, addresses: ad.map(a => ({ id: a.id, address: a.address, nicknames: a.nicknames || [] })),
         lists: pl.map(l => ({ id: l.id, companyId: l.company_id, addressId: l.address_id, createdAt: l.created_at, items: byList[l.id] || [] })),
-        profiles: pr, invites: inv, notifications: nt
+        vendors: vd, profiles: pr, invites: inv, notifications: nt
       };
       setOffline(false);
       try { localStorage.setItem(cacheKey(), JSON.stringify({ me, db })); } catch (e) { /* quota */ }
@@ -97,7 +104,7 @@
   function subscribe() {
     if (channel || !me) return;
     channel = sb.channel('pl-' + me.id);
-    ['companies', 'addresses', 'punchlists', 'items', 'item_ccs', 'profiles'].forEach(t =>
+    ['companies', 'addresses', 'punchlists', 'items', 'item_ccs', 'vendors', 'profiles'].forEach(t =>
       channel.on('postgres_changes', { event: '*', schema: 'public', table: t }, refreshSoon));
     channel.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, p => {
       if (p.new && p.new.message) toast('🔔 ' + p.new.message, 5000);
@@ -112,7 +119,7 @@
     session = s; me = null;
     if (!s) { unsubscribe(); db = emptyDb(); view = 'list'; render(); return; }
     try {
-      me = must(await sb.from('profiles').select('id,user_id,display_name,role,vendor_company').eq('user_id', s.user.id).maybeSingle());
+      me = must(await sb.from('profiles').select('id,user_id,display_name,role,vendor_id,vendor_company').eq('user_id', s.user.id).maybeSingle());
     } catch (e) {
       const cached = JSON.parse(localStorage.getItem(cacheKey()) || 'null');
       if (cached) { me = cached.me; db = cached.db; setOffline(true); if (!isAdmin()) view = 'mine'; render(); return; }
@@ -131,7 +138,7 @@
   async function redeem(code) {
     const r = must(await sb.rpc('redeem_invite', { p_code: code }));
     localStorage.removeItem(PENDING_CODE);
-    toast(`Welcome, ${r.display_name}! You're set up as ${r.role === 'admin' ? 'a project admin' : 'a vendor'}.`, 4000);
+    toast(`Welcome, ${r.display_name}! You're set up as ${r.role === 'admin' ? 'a project admin' : 'a vendor employee'}.`, 4000);
     view = r.role === 'admin' ? 'list' : 'mine';
     await onSession(session);
   }
@@ -142,6 +149,7 @@
   function fieldHtml(f) {
     const help = f.help ? `<small>${esc(f.help)}</small>` : '';
     if (f.type === 'textarea') return `<label class="field"><span>${esc(f.label)}</span><textarea name="${f.name}" rows="3" placeholder="${esc(f.placeholder || '')}">${esc(f.value || '')}</textarea>${help}</label>`;
+    if (f.type === 'rawselect') return `<label class="field"><span>${esc(f.label)}</span><select name="${f.name}">${f.html}</select>${help}</label>`;
     if (f.type === 'select') return `<label class="field"><span>${esc(f.label)}</span><select name="${f.name}">${f.options.map(o => `<option value="${esc(o.value)}" ${o.value === f.value ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select>${help}</label>`;
     if (f.type === 'checks') return `<div class="field"><span>${esc(f.label)}</span>${f.options.length ? `<div class="checks">${f.options.map(o => `<label><input type="checkbox" name="${f.name}" value="${esc(o.value)}" ${(f.value || []).includes(o.value) ? 'checked' : ''}>${esc(o.label)}</label>`).join('')}</div>` : '<small>Nobody to pick yet.</small>'}${help}</div>`;
     return `<label class="field"><span>${esc(f.label)}</span><input name="${f.name}" type="${f.type || 'text'}" value="${esc(f.value || '')}" placeholder="${esc(f.placeholder || '')}" autocomplete="${f.autocomplete || 'off'}" ${f.required ? 'required' : ''}>${help}</label>`;
@@ -240,29 +248,45 @@
     }
     l = { id: row.id, companyId: cId, addressId: aId, createdAt: row.created_at, items: [] }; db.lists.push(l); return l;
   }
-  async function addItems(cId, aId, texts, source = 'manual', assigneeId = null) {
+  async function addItems(cId, aId, texts, source = 'manual', assign = '') {
     if (!texts.length) return;
-    const l = await ensureList(cId, aId);
-    const rows = texts.map(text => ({ id: newId(), punchlist_id: l.id, text, source, assignee_id: assigneeId || null }));
+    const l = await ensureList(cId, aId), a = parseAssign(assign);
+    const rows = texts.map(text => ({ id: newId(), punchlist_id: l.id, text, source, vendor_id: a.vendor_id, assignee_id: a.assignee_id }));
     must(await sb.from('items').insert(rows));
-    rows.forEach(r => l.items.push({ id: r.id, text: r.text, done: false, assigneeId: r.assignee_id, source, createdAt: new Date().toISOString(), ccs: [] }));
+    rows.forEach(r => l.items.push({ id: r.id, text: r.text, done: false, vendorId: r.vendor_id, assigneeId: r.assignee_id, source, createdAt: new Date().toISOString(), ccs: [] }));
   }
-  const people = () => db.profiles.slice().sort((a, b) => (a.role === b.role ? 0 : a.role === 'vendor' ? -1 : 1) || a.display_name.localeCompare(b.display_name));
-  const personLabel = p => `${p.display_name}${p.vendor_company ? ' (' + p.vendor_company + ')' : ''}${p.role === 'admin' ? ' · admin' : ''}`;
+  const admins = () => db.profiles.filter(p => p.role === 'admin').sort((a, b) => a.display_name.localeCompare(b.display_name));
+  const vendorsSorted = () => (db.vendors || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+  // Assignment is encoded as "v:<vendor id>" (whole team), "p:<profile id>" (one person) or "" (nobody).
+  const assignValue = i => i.assigneeId ? 'p:' + i.assigneeId : i.vendorId ? 'v:' + i.vendorId : '';
+  function parseAssign(val) {
+    val = val || ''; if (val && !/^[vp]:/.test(val)) val = 'p:' + val; // v2 prefs stored a bare profile id
+    if (val.startsWith('v:') && vendor(val.slice(2))) return { vendor_id: val.slice(2), assignee_id: null };
+    if (val.startsWith('p:') && profile(val.slice(2))) { const p = profile(val.slice(2)); return { vendor_id: p.vendor_id || null, assignee_id: p.id }; }
+    return { vendor_id: null, assignee_id: null };
+  }
+  function assignOptions(sel, none = 'Nobody yet') {
+    if (sel && !/^[vp]:/.test(sel)) sel = 'p:' + sel;
+    const o = (v, l) => `<option value="${esc(v)}" ${v === sel ? 'selected' : ''}>${esc(l)}</option>`;
+    return o('', none) + vendorsSorted().map(v => `<optgroup label="${esc(v.name)}">${o('v:' + v.id, v.name + ' — whole team')}${employees(v.id).map(p => o('p:' + p.id, v.name + ' · ' + p.display_name)).join('')}</optgroup>`).join('')
+      + (admins().length ? `<optgroup label="Project admins">${admins().map(p => o('p:' + p.id, p.display_name)).join('')}</optgroup>` : '');
+  }
   async function editItem(id) {
     const [, it] = findItem(id); if (!it) return;
     const r = await formDialog({ title: 'Edit item', fields: [
       { name: 'text', label: 'Item', value: it.text, type: 'textarea' },
-      { name: 'assignee', label: 'Assigned to', type: 'select', value: it.assigneeId || '', options: [{ value: '', label: '— Nobody —' }, ...people().map(p => ({ value: p.id, label: personLabel(p) }))] },
-      { name: 'ccs', label: 'cc (notified when this is done)', type: 'checks', value: it.ccs, options: people().filter(p => p.role === 'vendor').map(p => ({ value: p.id, label: personLabel(p) })),
-        help: 'Pick vendors whose work depends on this item. They get a notification when it is checked off.' }
+      { name: 'assign', label: 'Assigned to', type: 'rawselect', html: assignOptions(assignValue(it), '— Nobody —'),
+        help: 'Pick a vendor to give it to the whole team (any employee can check it off), or one employee to narrow it.' },
+      { name: 'ccs', label: 'cc vendors (every employee is notified when this is done)', type: 'checks', value: it.ccs, options: vendorsSorted().map(v => ({ value: v.id, label: v.name })),
+        help: 'Pick vendors whose work depends on this item. They can see it (read-only) and get a notification when it is checked off.' }
     ] });
     if (!r || !r.text) return;
-    const assignee = r.assignee || null, ccs = r.ccs.filter(x => x !== assignee);
-    if (r.text !== it.text || assignee !== (it.assigneeId || null)) must(await sb.from('items').update({ text: r.text, assignee_id: assignee }).eq('id', id));
+    const a = parseAssign(r.assign), ccs = r.ccs.filter(x => x !== a.vendor_id);
+    if (r.text !== it.text || a.assignee_id !== (it.assigneeId || null) || a.vendor_id !== (it.vendorId || null))
+      must(await sb.from('items').update({ text: r.text, vendor_id: a.vendor_id, assignee_id: a.assignee_id }).eq('id', id));
     const add = ccs.filter(x => !it.ccs.includes(x)), del = it.ccs.filter(x => !ccs.includes(x));
-    if (add.length) must(await sb.from('item_ccs').insert(add.map(p => ({ item_id: id, profile_id: p }))));
-    if (del.length) must(await sb.from('item_ccs').delete().eq('item_id', id).in('profile_id', del));
+    if (add.length) must(await sb.from('item_ccs').insert(add.map(v => ({ item_id: id, vendor_id: v }))));
+    if (del.length) must(await sb.from('item_ccs').delete().eq('item_id', id).in('vendor_id', del));
     await refresh();
   }
   async function deleteItem(id) {
@@ -270,8 +294,8 @@
     must(await sb.from('items').delete().eq('id', id));
     l.items = l.items.filter(i => i.id !== id); render();
     toastUndo('Item deleted', () => guarded(async () => {
-      must(await sb.from('items').insert({ id: it.id, punchlist_id: l.id, text: it.text, done: it.done, done_at: it.doneAt || null, assignee_id: it.assigneeId || null, source: it.source || 'manual', created_at: it.createdAt }));
-      if (it.ccs.length) must(await sb.from('item_ccs').insert(it.ccs.map(p => ({ item_id: it.id, profile_id: p }))));
+      must(await sb.from('items').insert({ id: it.id, punchlist_id: l.id, text: it.text, done: it.done, done_at: it.doneAt || null, vendor_id: it.vendorId || null, assignee_id: it.assigneeId || null, source: it.source || 'manual', created_at: it.createdAt }));
+      if (it.ccs.length) must(await sb.from('item_ccs').insert(it.ccs.map(v => ({ item_id: it.id, vendor_id: v }))));
       await refresh();
     }));
   }
@@ -280,22 +304,46 @@
     const done = !it.done; it.done = done; it.doneAt = done ? new Date().toISOString() : null; it.doneBy = done ? me.id : null; render();
     try { must(await sb.rpc('set_item_done', { p_item_id: id, p_done: done })); }
     catch (e) { it.done = !done; render(); toast(e.message); return; }
-    if (done && it.ccs.length) toast(`Done. ${it.ccs.length} cc'd ${it.ccs.length === 1 ? 'person was' : 'people were'} notified.`);
+    if (done && it.ccs.length) toast(`Done. cc'd team${it.ccs.length === 1 ? '' : 's'} notified: ${it.ccs.map(vname).join(', ')}.`);
   }
 
   // ---------- people & invite codes ----------
   const liveCode = pid => db.invites.find(c => c.profile_id === pid && !c.used_at && new Date(c.expires_at) > new Date());
   const usedCode = pid => db.invites.filter(c => c.profile_id === pid && c.used_at).pop();
   const inviteText = code => `You're invited to the L&L Builders Punchlist app.\n1. Open ${APP_URL}\n2. Tap "Create account" and sign up with your email and a password.\n3. Paste this code: ${code}`;
-  async function addPerson() {
-    const r = await formDialog({ title: 'New person', intro: 'Create the profile first, then send them the invite code.', fields: [
-      { name: 'name', label: 'Name', placeholder: 'e.g. Mike Rossi', required: true },
-      { name: 'role', label: 'Account type', type: 'select', value: 'vendor', options: [{ value: 'vendor', label: 'Vendor: sees only items assigned to them' }, { value: 'admin', label: 'Project admin: sees and manages everything' }] },
-      { name: 'company', label: 'Vendor company (optional)', placeholder: "e.g. Mike's Plumbing" }
-    ], submit: 'Create & get code' });
+  async function addVendor() {
+    const r = await formDialog({ title: 'New vendor', intro: 'A vendor is a company or crew, e.g. <b>D2</b>. Add its employees next; each gets their own login.', fields: [
+      { name: 'name', label: 'Vendor name', placeholder: 'e.g. D2', required: true }], submit: 'Create vendor' });
+    if (!r || !r.name) return;
+    const v = must(await sb.from('vendors').insert({ id: newId(), name: r.name }).select('id,name,created_at').single());
+    db.vendors.push(v); render();
+    await addEmployee(v.id);
+  }
+  async function editVendor(id) {
+    const v = vendor(id); if (!v) return;
+    const r = await formDialog({ title: 'Rename vendor', fields: [{ name: 'name', label: 'Vendor name', value: v.name, required: true }] });
+    if (r && r.name) { must(await sb.from('vendors').update({ name: r.name }).eq('id', id)); await refresh(); }
+  }
+  async function deleteVendor(id) {
+    const v = vendor(id); if (!v) return; const n = employees(id).length;
+    if (!await confirmDialog('Remove vendor?', `Remove ${v.name}${n ? ` and its ${n} employee${n === 1 ? '' : 's'}` : ''}? Their items become unassigned and their logins lose all access.`, 'Remove')) return;
+    must(await sb.from('vendors').delete().eq('id', id)); await refresh();
+  }
+  async function addEmployee(vendorId) {
+    const v = vendor(vendorId); if (!v) return;
+    const r = await formDialog({ title: `Add employee to ${v.name}`, intro: `They'll see every ${esc(v.name)} item and can check them off. You'll get a one-time code to send them.`, fields: [
+      { name: 'name', label: 'Name', placeholder: 'e.g. Leo', required: true }], submit: 'Add & get code' });
     if (!r || !r.name) return;
     const pid = newId();
-    must(await sb.from('profiles').insert({ id: pid, display_name: r.name, role: r.role, vendor_company: r.company || null }));
+    must(await sb.from('profiles').insert({ id: pid, display_name: r.name, role: 'vendor', vendor_id: vendorId }));
+    const code = must(await sb.rpc('create_invite', { p_profile_id: pid }));
+    await refresh(); showCode(pid, code);
+  }
+  async function addAdmin() {
+    const r = await formDialog({ title: 'New project admin', intro: 'Admins see and manage everything.', fields: [{ name: 'name', label: 'Name', placeholder: 'e.g. Lisa', required: true }], submit: 'Create & get code' });
+    if (!r || !r.name) return;
+    const pid = newId();
+    must(await sb.from('profiles').insert({ id: pid, display_name: r.name, role: 'admin' }));
     const code = must(await sb.rpc('create_invite', { p_profile_id: pid }));
     await refresh(); showCode(pid, code);
   }
@@ -303,15 +351,16 @@
     const p = profile(id); if (!p) return;
     const self = p.id === me.id;
     const fields = [{ name: 'name', label: 'Name', value: p.display_name, required: true }];
-    if (!self) fields.push({ name: 'role', label: 'Account type', type: 'select', value: p.role, options: [{ value: 'vendor', label: 'Vendor' }, { value: 'admin', label: 'Project admin' }] });
-    fields.push({ name: 'company', label: 'Vendor company', value: p.vendor_company || '' });
+    if (!self) fields.push({ name: 'team', label: 'Team', type: 'select', value: p.vendor_id || 'admin',
+      options: [...vendorsSorted().map(v => ({ value: v.id, label: 'Employee of ' + v.name })), { value: 'admin', label: 'Project admin' }] });
     const r = await formDialog({ title: 'Edit person', fields }); if (!r || !r.name) return;
-    must(await sb.from('profiles').update({ display_name: r.name, role: self ? p.role : r.role, vendor_company: r.company || null }).eq('id', id));
+    const team = self ? (p.vendor_id || 'admin') : r.team;
+    must(await sb.from('profiles').update({ display_name: r.name, role: team === 'admin' ? 'admin' : 'vendor', vendor_id: team === 'admin' ? null : team }).eq('id', id));
     await refresh();
   }
   async function deletePerson(id) {
     const p = profile(id); if (!p || p.id === me.id) return;
-    if (!await confirmDialog('Remove person?', `Remove ${p.display_name}? Their items become unassigned and${p.user_id ? ' their account loses all access.' : ' their invite code stops working.'}`, 'Remove')) return;
+    if (!await confirmDialog('Remove person?', `Remove ${p.display_name}? Items narrowed to them stay with ${p.vendor_id ? vname(p.vendor_id) : 'nobody'}, and${p.user_id ? ' their account loses all access.' : ' their invite code stops working.'}`, 'Remove')) return;
     must(await sb.from('profiles').delete().eq('id', id)); await refresh();
   }
   async function newCode(id) {
@@ -370,7 +419,7 @@
   function listText(l) {
     const c = company(l.companyId), a = address(l.addressId);
     const open = l.items.filter(i => !i.done), done = l.items.filter(i => i.done);
-    const who = i => i.assigneeId ? ` [${pname(i.assigneeId)}]` : '';
+    const who = i => ownerLabel(i) ? ` [${ownerLabel(i)}]` : '';
     let s = `PUNCHLIST — ${c ? c.name : '?'} @ ${a ? a.address : '?'}${a && a.nicknames.length ? ` (${a.nicknames[0]})` : ''}\n${new Date().toLocaleDateString()}\n\n`;
     s += `OPEN (${open.length})\n` + (open.map(i => '☐ ' + i.text + who(i)).join('\n') || '—') + '\n';
     if (done.length) s += `\nDONE (${done.length})\n` + done.map(i => '☑ ' + i.text + who(i)).join('\n') + '\n';
@@ -443,11 +492,11 @@
 
   const tagsFor = (i, forAdmin) => {
     const t = [];
-    if (forAdmin) t.push(i.assigneeId ? `<span class="tag assignee">👷 ${esc(pname(i.assigneeId))}</span>` : '<span class="tag pending">Unassigned</span>');
-    if (forAdmin && i.ccs.length) t.push(`<span class="tag cc">cc ${esc(i.ccs.map(pname).join(', '))}</span>`);
+    if (forAdmin) t.push(ownerLabel(i) ? `<span class="tag assignee">👷 ${esc(ownerLabel(i))}</span>` : '<span class="tag pending">Unassigned</span>');
+    if (forAdmin && i.ccs.length) t.push(`<span class="tag cc">cc ${esc(i.ccs.map(vname).join(', '))}</span>`);
     return t.length ? `<div class="meta">${t.join('')}</div>` : '';
   };
-  const doneNote = i => i.done && i.doneAt ? `<small>Done ${fmtDate(i.doneAt)}${i.doneBy && i.doneBy !== me.id ? ' by ' + esc(pname(i.doneBy)) : ''}</small>` : '';
+  const doneNote = i => i.done && i.doneAt ? `<small class="doneby">Done ${fmtDate(i.doneAt)}${i.doneBy ? ' by ' + esc(byWho(i.doneBy)) : ''}</small>` : '';
 
   function viewList() {
     const cId = prefs.current.companyId, aId = prefs.current.addressId;
@@ -469,7 +518,7 @@
           <button class="check" data-action="toggle" data-id="${i.id}" aria-label="${i.done ? 'Mark open' : 'Mark done'}">${i.done ? '✓' : ''}</button>
           <div class="text" data-action="edit-item" data-id="${i.id}">${esc(i.text)}${doneNote(i)}${tagsFor(i, true)}</div>
           <button class="del" data-action="del-item" data-id="${i.id}" aria-label="Delete">✕</button></li>`;
-      const assignOpts = `<option value="">Nobody yet</option>${people().map(p => `<option value="${p.id}" ${p.id === prefs.ui.assignTo ? 'selected' : ''}>${esc(personLabel(p))}</option>`).join('')}`;
+      const assignOpts = assignOptions(prefs.ui.assignTo || '');
       body = `<form id="addForm" class="addbar"><input id="newItem" placeholder="Add item… (e.g. touch up paint in hall)" autocomplete="off" enterkeyhint="done"><button class="btn primary">Add item</button></form>
         <div class="addopts"><span>New items go to</span><select id="assignTo">${assignOpts}</select></div>
         <div class="section-h"><h3>Open <span class="pill">${open.length}</span></h3>
@@ -477,7 +526,7 @@
         ${open.length ? `<ul class="items">${open.map(row).join('')}</ul>` : `<p class="muted pad">${done.length ? 'All done! 🎉' : 'No items yet. Type one above and tap Add item.'}</p>`}
         ${done.length ? `<div class="section-h"><h3>Done <span class="pill done">${done.length}</span></h3><button class="btn small ghost" data-action="toggle-done">${prefs.ui.showDone ? 'Hide' : 'Show'}</button></div>
           ${prefs.ui.showDone ? `<ul class="items">${done.map(row).join('')}</ul>` : ''}` : ''}
-        <p class="muted small pad">Tap an item to edit it, assign a vendor or cc people who should hear when it's done.</p>`;
+        <p class="muted small pad">Tap an item to edit it, assign a vendor (or one of its employees) or cc vendors who should hear when it's done.</p>`;
     }
     const c = company(cId), a = address(aId);
     return `<div class="pickers">${selCompany}${selAddr}</div>
@@ -499,22 +548,32 @@
   }
 
   function viewTeam() {
-    const all = people();
-    const card = p => {
+    const openFor = pred => db.lists.reduce((n, l) => n + l.items.filter(i => !i.done && pred(i)).length, 0);
+    const person = p => {
       const live = liveCode(p.id), used = usedCode(p.id);
-      const open = db.lists.reduce((n, l) => n + l.items.filter(i => !i.done && i.assigneeId === p.id).length, 0);
+      const open = openFor(i => i.assigneeId === p.id);
       const status = p.user_id ? `<span class="tag linked">✓ Linked${used && used.used_email ? ' · ' + esc(used.used_email) : ''}</span>` : `<span class="tag pending">Not signed up yet</span>`;
-      return `<li class="card col"><div class="row"><div class="grow"><b>${esc(p.display_name)}</b>${p.id === me.id ? ' <span class="muted small">(you)</span>' : ''}
-          <div class="muted small">${esc(p.vendor_company || '')}</div></div><span class="tag ${p.role}">${p.role === 'admin' ? 'Admin' : 'Vendor'}</span></div>
-        <div class="meta">${status}${open ? `<span class="tag assignee">${open} open item${open === 1 ? '' : 's'}</span>` : ''}</div>
+      return `<li class="emp" data-person="${p.id}"><div class="row"><div class="grow"><b>${esc(p.display_name)}</b>${p.id === me.id ? ' <span class="muted small">(you)</span>' : ''}</div>
+          ${open ? `<span class="tag assignee">${open} item${open === 1 ? '' : 's'} just for them</span>` : ''}</div>
+        <div class="meta">${status}</div>
         ${!p.user_id && live ? `<div class="row"><div class="code grow">${esc(live.code)}</div><button class="btn small ghost" data-action="copy-invite" data-code="${esc(live.code)}">Share</button></div><small class="muted">Expires ${fmtDate(live.expires_at)}</small>` : ''}
         <div class="row end">${!p.user_id ? `<button class="btn small ghost" data-action="new-code" data-id="${p.id}">${live ? 'New code' : 'Get code'}</button>` : ''}
           <button class="btn small ghost" data-action="edit-person" data-id="${p.id}">Edit</button>
           ${p.id !== me.id ? `<button class="btn small ghost dangertext" data-action="del-person" data-id="${p.id}">Remove</button>` : ''}</div></li>`;
     };
-    return `<div class="section-h"><h2 class="title">Team</h2><button class="btn small primary" data-action="add-person">＋ Person</button></div>
-      <p class="muted small pad">Create a profile, then send the person their one-time invite code. They sign up with email + password and paste it. Vendors only see items assigned to them (plus items they're cc'd on).</p>
-      <ul class="cards">${all.map(card).join('')}</ul>`;
+    const vcard = v => {
+      const emps = employees(v.id).sort((a, b) => a.display_name.localeCompare(b.display_name)), open = openFor(i => i.vendorId === v.id);
+      return `<li class="card col vendor" data-vendor="${v.id}"><div class="row"><div class="grow"><b class="vname">🏷️ ${esc(v.name)}</b>
+          <div class="muted small">${emps.length} employee${emps.length === 1 ? '' : 's'} · ${open} open item${open === 1 ? '' : 's'}</div></div>
+          <button class="btn small ghost" data-action="edit-vendor" data-id="${v.id}">Rename</button><button class="btn small ghost dangertext" data-action="del-vendor" data-id="${v.id}" aria-label="Remove vendor">✕</button></div>
+        ${emps.length ? `<ul class="emps">${emps.map(person).join('')}</ul>` : '<p class="muted small">No employees yet.</p>'}
+        <button class="btn small primary" data-action="add-employee" data-id="${v.id}">＋ Employee</button></li>`;
+    };
+    return `<div class="section-h"><h2 class="title">Vendors</h2><button class="btn small primary" data-action="add-vendor">＋ Vendor</button></div>
+      <p class="muted small pad">Add a vendor (e.g. D2), then its employees (e.g. Leo). Each employee gets a one-time code, signs up with their own email + password and pastes it. Everyone on a vendor sees all of that vendor's items, plus items the vendor is cc'd on.</p>
+      ${vendorsSorted().length ? `<ul class="cards">${vendorsSorted().map(vcard).join('')}</ul>` : '<p class="muted pad">No vendors yet.</p>'}
+      <div class="section-h"><h2 class="title">Project admins</h2><button class="btn small ghost" data-action="add-admin">＋ Admin</button></div>
+      <ul class="cards"><li class="card col"><ul class="emps">${admins().map(person).join('')}</ul></li></ul>`;
   }
 
   function viewProfiles() {
@@ -531,19 +590,22 @@
   function viewMine() {
     const mineItems = [], ccItems = [];
     db.lists.forEach(l => l.items.forEach(i => {
-      if (i.assigneeId === me.id) mineItems.push([l, i]); else if (i.ccs.includes(me.id)) ccItems.push([l, i]);
+      if (me.vendor_id && i.vendorId === me.vendor_id) mineItems.push([l, i]); else if (me.vendor_id && i.ccs.includes(me.vendor_id)) ccItems.push([l, i]);
     }));
     const jobName = l => { const c = company(l.companyId), a = address(l.addressId); return `${c ? c.name : '?'} @ ${a ? addrLabel(a) : '?'}`; };
     const group = rows => { const g = {}; rows.forEach(([l, i]) => (g[l.id] = g[l.id] || { l, items: [] }).items.push(i)); return Object.values(g); };
     const open = mineItems.filter(([, i]) => !i.done), done = mineItems.filter(([, i]) => i.done);
     const row = (i, ro) => `<li class="item ${i.done ? 'done' : ''} ${ro ? 'readonly' : ''}">
         ${ro ? `<span class="check" aria-hidden="true">${i.done ? '✓' : ''}</span>` : `<button class="check" data-action="toggle" data-id="${i.id}" aria-label="${i.done ? 'Mark open' : 'Mark done'}">${i.done ? '✓' : ''}</button>`}
-        <div class="text">${esc(i.text)}${doneNote(i)}${ro ? `<div class="meta"><span class="tag assignee">👷 ${esc(pname(i.assigneeId))}</span><span class="tag cc">${i.done ? 'Done' : 'In progress'}</span></div>` : ''}</div></li>`;
+        <div class="text">${esc(i.text)}${doneNote(i)}${ro ? `<div class="meta"><span class="tag assignee">👷 ${esc(ownerLabel(i) || 'Unassigned')}</span><span class="tag cc">${i.done ? 'Done' : 'In progress'}</span></div>`
+          : i.assigneeId ? `<div class="meta"><span class="tag ${i.assigneeId === me.id ? 'linked' : 'assignee'}">👤 ${i.assigneeId === me.id ? 'For you' : 'For ' + esc(pname(i.assigneeId))}</span></div>` : ''}</div></li>`;
     const groups = (rows, ro) => group(rows).map(g => `<div class="job-h">${esc(jobName(g.l))}</div><ul class="items">${g.items.map(i => row(i, ro)).join('')}</ul>`).join('');
+    const team = vendor(me.vendor_id), mates = employees(me.vendor_id).filter(p => p.id !== me.id).map(p => p.display_name);
     return `<h2 class="title">Hi ${esc(me.display_name.split(' ')[0])} 👋</h2>
-      <div class="section-h"><h3>My open items <span class="pill">${open.length}</span></h3></div>
-      ${open.length ? groups(open, false) : `<p class="muted pad">${done.length ? 'All your items are done! 🎉' : 'Nothing assigned to you yet.'}</p>`}
-      ${ccItems.length ? `<div class="section-h"><h3>FYI · you're cc'd <span class="pill">${ccItems.length}</span></h3></div><p class="muted small pad">Other trades' items that affect your work. You'll get a notification when they're done.</p>${groups(ccItems, true)}` : ''}
+      ${team ? `<p class="muted small pad team-line">🏷️ <b>${esc(team.name)}</b>${mates.length ? ' · with ' + esc(mates.join(', ')) : ''}</p>` : ''}
+      <div class="section-h"><h3>${team ? esc(team.name) + "'s" : 'My'} open items <span class="pill">${open.length}</span></h3></div>
+      ${open.length ? groups(open, false) : `<p class="muted pad">${done.length ? 'All your team\'s items are done! 🎉' : 'Nothing assigned to your team yet.'}</p>`}
+      ${ccItems.length ? `<div class="section-h"><h3>FYI · ${team ? esc(team.name) + ' is' : "you're"} cc'd <span class="pill">${ccItems.length}</span></h3></div><p class="muted small pad">Other trades' items that affect your work. You'll get a notification when they're done.</p>${groups(ccItems, true)}` : ''}
       ${done.length ? `<div class="section-h"><h3>Done <span class="pill done">${done.length}</span></h3><button class="btn small ghost" data-action="toggle-done">${prefs.ui.showDone ? 'Hide' : 'Show'}</button></div>${prefs.ui.showDone ? groups(done, false) : ''}` : ''}`;
   }
 
@@ -552,16 +614,16 @@
     return `<div class="section-h"><h2 class="title">Notifications</h2>${unread() ? '<button class="btn small ghost" data-action="read-all">Mark all read</button>' : ''}</div>
       ${ns.length ? `<ul class="cards">${ns.map(n => `<li class="card notif tap ${n.read_at ? '' : 'unread'}" data-action="open-notif" data-id="${n.id}">
         <span class="ico">${ico[n.kind] || '🔔'}</span><div class="grow"><b>${esc(n.message)}</b><div class="muted small">${fmtWhen(n.created_at)}</div></div></li>`).join('')}</ul>`
-        : '<div class="empty"><div class="big">🔔</div><p>No notifications yet.</p><p class="muted">You\'ll hear here when items you\'re cc\'d on are finished or new work is assigned to you.</p></div>'}`;
+        : '<div class="empty"><div class="big">🔔</div><p>No notifications yet.</p><p class="muted">You\'ll hear here when items your team is cc\'d on are finished or new work is assigned to your team.</p></div>'}`;
   }
 
   function viewSettings() {
     const s = prefs.settings;
     const radio = (v, label, sub) => `<label class="radio"><input type="radio" name="provider" value="${v}" ${s.provider === v ? 'checked' : ''}><span><b>${label}</b><small>${sub}</small></span></label>`;
     const account = `<h2 class="title">Account</h2><div class="card col">
-        <div class="row"><div class="grow"><b>${esc(me.display_name)}</b><div class="muted small">${esc(session.user.email)}${me.vendor_company ? ' · ' + esc(me.vendor_company) : ''}</div></div><span class="tag ${me.role}">${isAdmin() ? 'Admin' : 'Vendor'}</span></div>
+        <div class="row"><div class="grow"><b>${esc(me.display_name)}</b><div class="muted small">${esc(session.user.email)}${me.vendor_id ? ' · ' + esc(vname(me.vendor_id)) : ''}</div></div><span class="tag ${me.role}">${isAdmin() ? 'Admin' : 'Vendor'}</span></div>
         <div class="row end"><button class="btn ghost" data-action="signout">Sign out</button></div></div>`;
-    if (!isAdmin()) return account + `<p class="muted small pad">Punchlist v2 · L&amp;L Builders</p>`;
+    if (!isAdmin()) return account + `<p class="muted small pad">Punchlist v3 · L&amp;L Builders</p>`;
     const old = oldLocalData();
     return account + `<h2 class="title">Photo transcription</h2>
       <div class="card col">
@@ -585,7 +647,7 @@
         <label class="btn ghost">Import backup<input type="file" id="importFile" accept="application/json,.json" hidden></label>
         ${old ? '<button class="btn ghost" data-action="import-phone">Upload this phone\'s old data</button>' : ''}</div>
       </div>
-      <p class="muted small pad">Punchlist v2 · L&amp;L Builders</p>`;
+      <p class="muted small pad">Punchlist v3 · L&amp;L Builders</p>`;
   }
 
   // ---------- scan / review ----------
@@ -642,7 +704,7 @@
         ${r.addressChoice === '__new' ? `<label class="field"><span>Full address</span><input id="rvNewAddress" value="${esc(r.newAddress)}" placeholder="123 Ocean Blvd, Boca Raton, FL"></label>
           <label class="field"><span>Nickname</span><input id="rvNewNick" value="${esc(r.newNick)}" placeholder="optional, e.g. Ocean"></label>` : ''}
         ${r.addressChoice && r.addressChoice !== '__new' && r.address && !writtenIsKnown ? `<label class="check-line"><input type="checkbox" id="rvAddNick" ${r.addNick ? 'checked' : ''}> Save “${esc(r.address)}” as a nickname for this address</label>` : ''}
-        <label class="field"><span>Assign these items to</span><select id="rvAssign"><option value="">Nobody yet</option>${people().map(p => `<option value="${p.id}" ${p.id === r.assignTo ? 'selected' : ''}>${esc(personLabel(p))}</option>`).join('')}</select></label>
+        <label class="field"><span>Assign these items to</span><select id="rvAssign">${assignOptions(r.assignTo || '')}</select></label>
       </div>
       <div class="section-h"><h3>Items <span class="pill">${r.items.filter(x => x.trim()).length}</span></h3><button class="btn small ghost" data-action="rv-add">＋ Line</button></div>
       <ul class="items edit">${r.items.map((t, i) => `<li class="item"><textarea class="grow rvItem" data-i="${i}" rows="1">${esc(t)}</textarea><button class="del" data-action="rv-del" data-i="${i}" aria-label="Remove">✕</button></li>`).join('')}</ul>
@@ -688,7 +750,7 @@
     try { await fn(); } catch (e) { toast(e.message || String(e), 4000); }
   }
   const needsOnline = new Set(['add-company', 'add-address', 'edit-company', 'del-company', 'edit-address', 'del-address', 'add-nick', 'toggle', 'edit-item', 'del-item',
-    'add-person', 'edit-person', 'del-person', 'new-code', 'read-all', 'import-phone', 'rv-save']);
+    'add-vendor', 'edit-vendor', 'del-vendor', 'add-employee', 'add-admin', 'edit-person', 'del-person', 'new-code', 'read-all', 'import-phone', 'rv-save']);
   document.addEventListener('click', e => guarded(async () => {
     const tab = e.target.closest('.tabbar button');
     if (tab) { if (view === 'review' && !(await confirmDialog('Leave scan?', 'Discard this scan review?', 'Discard'))) return; review = null; view = tab.dataset.view; render(); window.scrollTo(0, 0); return; }
@@ -716,7 +778,11 @@
       case 'share': return shareList();
       case 'print': return window.print();
       case 'open-list': prefs.current = { companyId: el.dataset.c, addressId: el.dataset.a }; savePrefs(); view = 'list'; return render();
-      case 'add-person': return addPerson();
+      case 'add-vendor': return addVendor();
+      case 'edit-vendor': return editVendor(id);
+      case 'del-vendor': return deleteVendor(id);
+      case 'add-employee': return addEmployee(id);
+      case 'add-admin': return addAdmin();
       case 'edit-person': return editPerson(id);
       case 'del-person': return deletePerson(id);
       case 'new-code': return newCode(id);
@@ -733,7 +799,7 @@
       case 'import-phone': { const d = oldLocalData(); if (d) await importData(d, true); return; }
       case 'export': {
         const out = { exportedAt: new Date().toISOString(), companies: db.companies, addresses: db.addresses,
-          lists: db.lists.map(l => ({ id: l.id, companyId: l.companyId, addressId: l.addressId, items: l.items.map(i => ({ id: i.id, text: i.text, done: i.done, doneAt: i.doneAt, createdAt: i.createdAt, assignee: i.assigneeId ? pname(i.assigneeId) : null, cc: i.ccs.map(pname) })) })) };
+          lists: db.lists.map(l => ({ id: l.id, companyId: l.companyId, addressId: l.addressId, items: l.items.map(i => ({ id: i.id, text: i.text, done: i.done, doneAt: i.doneAt, createdAt: i.createdAt, assignee: ownerLabel(i) || null, doneBy: i.doneBy ? pname(i.doneBy) : null, cc: i.ccs.map(vname) })) })) };
         const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `punchlist-backup-${new Date().toISOString().slice(0, 10)}.json`; a.click(); return;
       }

@@ -107,3 +107,12 @@ dialog::backdrop { background: rgba(15,25,40,.5); }
 .checks label { display: flex; gap: 10px; align-items: center; min-height: 40px; font-size: 16px; }
 .checks input { width: 22px; min-height: 22px; height: 22px; flex: none; }
 @media print { .bell, .offline, .addopts { display: none !important; } }
+/* v3: vendor teams */
+.card.vendor { align-items: stretch; border-left: 4px solid var(--orange); }
+.card .vname { font-size: 18px; }
+.emps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.emp { border: 1.5px solid var(--line); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; background: #fbfcfd; }
+.card.col > .btn.primary.small { align-self: flex-start; }
+.team-line { margin-top: -6px; }
+small.doneby { display: block; }
+optgroup { font-weight: 700; }
